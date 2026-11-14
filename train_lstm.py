@@ -13,13 +13,20 @@ Usage:
   python train_lstm.py --no-db         # seed only
   python train_lstm.py --epochs 60 --out lstm_weights.npz
 
+Besides the weights, it writes results/training_results.md and .json: held-out
+top-1/top-3 accuracy (LSTM vs. bigram and unigram baselines, mean ± std over
+several random splits), perplexity, the loss curve and sample predictions.
+
 Restart the API afterwards (or redeploy) so it loads the new weights.
 """
 
 import argparse
+import datetime as dt
 import json
+import math
 import os
 import random
+import time
 from collections import Counter, defaultdict
 
 from lstm_model import NextIconLSTM
@@ -124,44 +131,39 @@ SEED_SENTENCES = [
     "go_a places_office please", "go_a places_classroom", "line_up go_a places_hallway",
     "go_a places_home", "comm_i_want go_a places_home", "sick go_a places_home please",
     "tired go_a places_home", "people_mom places_home", "places_classroom too_loud",
-    # Countries
-    "people_me flag_ph", "comm_i_like flag_jp", "comm_i_like flag_kr", "people_teacher flag_us",
-    "read flag_gb", "question flag_cn", "show_me flag_fr please", "people_mom flag_in",
-    "people_dad flag_mx", "comm_i_want go_a flag_au", "comm_i_like flag_br",
+    # Not understanding
+    "not_understand repeat", "not_understand show_me", "not_understand help please",
+    "not_understand comm_slower please", "people_me not_understand repeat please",
+    "not_understand question teacher", "not_understand repeat comm_slower please",
 ]
 
 
 def _country_sentences() -> list[list[str]]:
-    """One or two sentences per flag so every country is a known token."""
-    frames = [["people_me"], ["comm_i_like"], ["comm_i_want", "go_a"], ["question"], ["people_friend"]]
-    out = []
-    for i, flag in enumerate(FLAG_IDS):
-        out.append(frames[i % len(frames)] + [flag])
-        out.append(frames[(i + 2) % len(frames)] + [flag])
-    return out
+    """One sentence per flag so every country is a known token. Kept unweighted so
+    flags don't crowd out the everyday continuations of these frames."""
+    frames = [["comm_i_like"], ["comm_i_want", "go_a"], ["question"], ["people_me"]]
+    return [frames[i % len(frames)] + [flag] for i, flag in enumerate(FLAG_IDS)]
 
 
-def _math_sentences(rng: random.Random, n: int = 60) -> list[list[str]]:
-    """Simple arithmetic sentences: num op num equals num."""
+def _math_sentences() -> list[list[str]]:
+    """Every arithmetic fact with operands 0-10 and a result in 0-10:
+    num op num equals num (every tenth one starts with math_answer)."""
     ops = {"math_plus": lambda a, b: a + b, "math_minus": lambda a, b: a - b,
-           "math_times": lambda a, b: a * b, "math_divide": lambda a, b: a // b if b else None}
+           "math_times": lambda a, b: a * b, "math_divide": lambda a, b: a // b}
     out = []
-    while len(out) < n:
-        op = rng.choice(list(ops))
-        a, b = rng.randint(0, 10), rng.randint(1, 10)
-        r = ops[op](a, b)
-        if r is None or not 0 <= r <= 10 or (op == "math_divide" and a % b):
-            continue
-        seq = [f"num_{a}", op, f"num_{b}", "math_equals", f"num_{r}"]
-        if rng.random() < 0.1:
-            seq = ["math_answer"] + seq
-        out.append(seq)
+    for op, f in ops.items():
+        for a in range(11):
+            for b in range(1, 11):
+                r = f(a, b)
+                if not 0 <= r <= 10 or (op == "math_divide" and a % b):
+                    continue
+                seq = [f"num_{a}", op, f"num_{b}", "math_equals", f"num_{r}"]
+                out.append(["math_answer"] + seq if len(out) % 10 == 0 else seq)
     return out
 
 
-def seed_corpus(seed: int = 0) -> list[list[str]]:
-    rng = random.Random(seed)
-    return [s.split() for s in SEED_SENTENCES] * 4 + _country_sentences() * 2 + _math_sentences(rng)
+def seed_corpus() -> list[list[str]]:
+    return [s.split() for s in SEED_SENTENCES] * 4 + _country_sentences() + _math_sentences()
 
 
 def db_sentences() -> list[list[str]]:
@@ -191,52 +193,229 @@ def db_sentences() -> list[list[str]]:
     return out
 
 
-def _top3_accuracy(predict, sentences):
-    hits = total = 0
+# ── Evaluation ────────────────────────────────────────────────────────────────
+# Every predictor maps a prefix (icons tapped so far) to a ranked list of
+# candidate next icons. Like NextIconLSTM.predict, baselines never suggest the
+# icon that was just tapped, so all models are scored under the same rule.
+
+SLICES = {
+    "all":          lambda seq, t: True,
+    "context = 1":  lambda seq, t: t == 1,
+    "context >= 2": lambda seq, t: t >= 2,
+    "math":         lambda seq, t: _is_math(seq),
+    "math answer":  lambda seq, t: seq[t - 1] == "math_equals",
+    "non-math":     lambda seq, t: not _is_math(seq),
+}
+
+
+def _is_math(seq):
+    return any(tok.startswith(("num_", "math_plus", "math_minus", "math_times", "math_divide"))
+               for tok in seq)
+
+
+def _evaluate(predict, sentences):
+    """Top-1 / top-3 next-icon accuracy at every position after the first icon,
+    reported overall and per slice. Returns {slice: {top1, top3, n}}."""
+    counts = {name: [0, 0, 0] for name in SLICES}
     for seq in sentences:
         for t in range(1, len(seq)):
-            total += 1
-            hits += seq[t] in predict(seq[:t])
-    return hits / max(total, 1)
+            ranked = predict(seq[:t])
+            for name, keep in SLICES.items():
+                if keep(seq, t):
+                    c = counts[name]
+                    c[0] += ranked[:1] == [seq[t]]
+                    c[1] += seq[t] in ranked[:3]
+                    c[2] += 1
+    return {name: {"top1": h1 / n if n else None, "top3": h3 / n if n else None, "n": n}
+            for name, (h1, h3, n) in counts.items()}
+
+
+def _perplexity(model, sentences):
+    """exp(mean negative log-likelihood) of the true next icon, same positions as _evaluate."""
+    nll, n = 0.0, 0
+    for seq in sentences:
+        for t in range(1, len(seq)):
+            probs = model.next_probs(seq[:t])
+            nll -= math.log(probs[model.index[seq[t]]] + 1e-12)
+            n += 1
+    return math.exp(nll / max(n, 1))
+
+
+def _unigram_baseline(train):
+    ranked = [w for w, _ in Counter(t for s in train for t in s).most_common()]
+    return lambda prefix: [w for w in ranked if w != prefix[-1]][:3]
 
 
 def _bigram_baseline(train):
+    """Most frequent follower of the last icon, backing off to overall frequency."""
     counts = defaultdict(Counter)
     for seq in train:
         for a, b in zip(seq, seq[1:]):
             counts[a][b] += 1
-    return lambda prefix: [w for w, _ in counts[prefix[-1]].most_common(3)]
+    fallback = [w for w, _ in Counter(t for s in train for t in s).most_common()]
+
+    def predict(prefix):
+        last = prefix[-1]
+        out = [w for w, _ in counts[last].most_common() if w != last]
+        out += [w for w in fallback if w != last and w not in out]
+        return out[:3]
+    return predict
+
+
+def _split(corpus, seed, test_frac):
+    """Hold out a fraction of the *distinct* sentences. Training keeps the corpus
+    weighting (repeats) of the remaining ones, as the final model does."""
+    unique = sorted({tuple(s) for s in corpus})
+    random.Random(seed).shuffle(unique)
+    test = set(unique[:round(len(unique) * test_frac)])
+    return [s for s in corpus if tuple(s) not in test], [list(s) for s in sorted(test)]
+
+
+def _mean_std(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None, None
+    m = sum(values) / len(values)
+    return m, math.sqrt(sum((v - m) ** 2 for v in values) / len(values))
+
+
+SAMPLE_PREFIXES = [
+    ["water"], ["sick"], ["tired"], ["confused"], ["not_understand"], ["comm_i_want"],
+    ["comm_i_like"], ["people_me"], ["people_mom"], ["go_a"], ["sick", "go_a"],
+    ["line_up", "go_a"], ["teacher"], ["happy", "teacher"], ["sick", "teacher"],
+    ["num_3", "math_plus", "num_4", "math_equals"], ["num_8", "math_minus", "num_2", "math_equals"],
+]
+
+
+def _write_report(path_base, report):
+    with open(path_base + ".json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    cfg, data, ev = report["config"], report["data"], report["evaluation"]
+    pct = lambda v: "–" if v is None else f"{v * 100:.1f}%"
+    pm = lambda s: f"{pct(s['mean'])} ± {s['std'] * 100:.1f}" if s["mean"] is not None else "–"
+    lines = [
+        "# Next-icon LSTM — training results", "",
+        f"Generated {report['generated']} by `train_lstm.py`.", "",
+        "## Data", "",
+        "| | |", "|---|---|",
+        f"| Icons in vocabulary | {data['vocab_size']} |",
+        f"| Real student sentences (aac_logs) | {data['real_sentences']} |",
+        f"| Seed sentences (hand-written + generated) | {data['seed_sentences']} |",
+        f"| Training sequences (after weighting) | {data['training_sequences']} |",
+        f"| Distinct sentences | {data['distinct_sentences']} |",
+        f"| Average sentence length | {data['avg_length']:.2f} icons |", "",
+        "## Model and training", "",
+        "| | |", "|---|---|",
+        f"| Architecture | Embedding ({cfg['embed_dim']}) → LSTM ({cfg['hidden_dim']}) → softmax ({data['vocab_size']}) |",
+        f"| Parameters | {cfg['parameters']:,} |",
+        f"| Optimizer | Adam, lr {cfg['lr']}, weight decay {cfg['weight_decay']}, grad clip {cfg['clip']} |",
+        f"| Epochs | {cfg['epochs']} |",
+        f"| Training time (final model) | {report['final_model']['train_seconds']:.1f} s |",
+        f"| Weights file size | {report['final_model']['weights_kb']:.0f} KB |", "",
+        "## Held-out evaluation", "",
+        f"{ev['test_frac']:.0%} of distinct sentences held out, repeated over {len(ev['seeds'])} random "
+        f"splits (seeds {', '.join(map(str, ev['seeds']))}); mean ± standard deviation. "
+        "Every position after the first icon is scored; the icon just tapped is never suggested.", "",
+        "| Slice | Positions | Model | Top-1 | Top-3 |", "|---|---|---|---|---|",
+    ]
+    for name in SLICES:
+        n = ev["summary"]["lstm"][name]["n"]
+        for model in ("lstm", "bigram", "unigram"):
+            s = ev["summary"][model][name]
+            lines.append(f"| {name} | {n:.0f} | {model} | {pm(s['top1'])} | {pm(s['top3'])} |")
+    ppl = ev["summary"]["lstm_perplexity"]
+    lines += ["", f"LSTM held-out perplexity: {ppl['mean']:.2f} ± {ppl['std']:.2f}", "",
+              "## Training loss (final model)", "", "| Epoch | Loss |", "|---|---|"]
+    curve = report["final_model"]["loss_curve"]
+    for e in sorted({1, *range(5, len(curve) + 1, 5), len(curve)}):
+        lines.append(f"| {e} | {curve[e - 1]:.4f} |")
+    lines += ["", "## Sample predictions (final model)", "", "| Icons tapped | Top-3 next icons |", "|---|---|"]
+    for row in report["final_model"]["samples"]:
+        preds = ", ".join(f"{w} ({p * 100:.0f}%)" for w, p in row["predictions"])
+        lines.append(f"| {' → '.join(row['prefix'])} | {preds} |")
+    with open(path_base + ".md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def main():
+    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=40)
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "lstm_weights.npz"))
+    ap.add_argument("--out", default=os.path.join(here, "lstm_weights.npz"))
+    ap.add_argument("--report", default=os.path.join(here, "results", "training_results"),
+                    help="writes <report>.json and <report>.md")
+    ap.add_argument("--eval-seeds", type=int, default=5, help="number of random held-out splits")
+    ap.add_argument("--test-frac", type=float, default=0.15)
     ap.add_argument("--no-db", action="store_true")
     args = ap.parse_args()
 
     real = [] if args.no_db else db_sentences()
-    corpus = seed_corpus() + real * REAL_WEIGHT
+    seed = seed_corpus()
+    corpus = seed + real * REAL_WEIGHT
     print(f"{len(real)} real sentences from DB, {len(corpus)} training sequences total")
 
-    # Held-out check: train on 85%, report top-3 next-icon accuracy vs. a bigram.
-    rng = random.Random(1)
-    unique = list({tuple(s) for s in corpus})
-    rng.shuffle(unique)
-    cut = int(len(unique) * 0.85)
-    train_set = [list(s) for s in unique[:cut]]
-    test_set = [list(s) for s in unique[cut:]]
-    probe = NextIconLSTM(ICON_IDS)
-    probe.train(train_set, epochs=args.epochs, verbose=False)
-    lstm_acc = _top3_accuracy(lambda p: [w for w, _ in probe.predict(p, 3)], test_set)
-    bigram_acc = _top3_accuracy(_bigram_baseline(train_set), test_set)
-    print(f"held-out top-3 accuracy: LSTM {lstm_acc:.1%}  |  bigram baseline {bigram_acc:.1%}")
+    # Held-out evaluation over several splits: LSTM vs. bigram vs. unigram.
+    seeds = list(range(1, args.eval_seeds + 1))
+    runs = []
+    for s in seeds:
+        train_set, test_set = _split(corpus, s, args.test_frac)
+        probe = NextIconLSTM(ICON_IDS)
+        probe.train(train_set, epochs=args.epochs, verbose=False)
+        run = {
+            "seed": s, "train_sequences": len(train_set), "test_sentences": len(test_set),
+            "lstm": _evaluate(lambda p: [w for w, _ in probe.predict(p, 3)], test_set),
+            "bigram": _evaluate(_bigram_baseline(train_set), test_set),
+            "unigram": _evaluate(_unigram_baseline(train_set), test_set),
+            "lstm_perplexity": _perplexity(probe, test_set),
+        }
+        runs.append(run)
+        print(f"split {s}: top-3  LSTM {run['lstm']['all']['top3']:.1%}  "
+              f"bigram {run['bigram']['all']['top3']:.1%}  unigram {run['unigram']['all']['top3']:.1%}")
+
+    summary = {}
+    for model in ("lstm", "bigram", "unigram"):
+        summary[model] = {}
+        for name in SLICES:
+            entry = {"n": sum(r[model][name]["n"] for r in runs) / len(runs)}
+            for metric in ("top1", "top3"):
+                m, sd = _mean_std([r[model][name][metric] for r in runs])
+                entry[metric] = {"mean": m, "std": sd}
+            summary[model][name] = entry
+    m, sd = _mean_std([r["lstm_perplexity"] for r in runs])
+    summary["lstm_perplexity"] = {"mean": m, "std": sd}
+    for model in ("lstm", "bigram", "unigram"):
+        a = summary[model]["all"]
+        print(f"held-out mean  {model:8s} top-1 {a['top1']['mean']:.1%}  top-3 {a['top3']['mean']:.1%}")
 
     # Final model on everything.
     model = NextIconLSTM(ICON_IDS)
-    model.train(corpus, epochs=args.epochs)
+    start = time.perf_counter()
+    curve = model.train(corpus, epochs=args.epochs)
+    train_seconds = time.perf_counter() - start
     model.save(args.out)
     print(f"saved {args.out}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
+    distinct = {tuple(s) for s in corpus}
+    report = {
+        "generated": dt.datetime.now().isoformat(timespec="seconds"),
+        "config": {"epochs": args.epochs, "lr": 0.01, "weight_decay": 1e-4, "clip": 5.0,
+                   "embed_dim": model.D, "hidden_dim": model.H,
+                   "parameters": int(sum(v.size for v in model.params.values()))},
+        "data": {"vocab_size": len(model.vocab) - 1, "real_sentences": len(real),
+                 "seed_sentences": len(seed), "training_sequences": len(corpus),
+                 "distinct_sentences": len(distinct),
+                 "avg_length": sum(len(s) for s in distinct) / len(distinct)},
+        "evaluation": {"test_frac": args.test_frac, "seeds": seeds, "runs": runs, "summary": summary},
+        "final_model": {
+            "train_seconds": train_seconds, "loss_curve": curve,
+            "weights_kb": os.path.getsize(args.out if args.out.endswith(".npz") else args.out + ".npz") / 1024,
+            "samples": [{"prefix": p, "predictions": model.predict(p, 3)} for p in SAMPLE_PREFIXES],
+        },
+    }
+    _write_report(args.report, report)
+    print(f"wrote {args.report}.md and {args.report}.json")
 
 
 if __name__ == "__main__":
